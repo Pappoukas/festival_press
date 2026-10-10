@@ -102,7 +102,9 @@ def fetch_all(clips: pd.DataFrame, existing: pd.DataFrame | None = None, delay: 
         if r.url:
             time.sleep(delay)
     out.append(pd.DataFrame(rows))
-    return pd.concat(out, ignore_index=True).reindex(columns=ARTICLE_COLS)
+    res = pd.concat([o for o in out if not o.empty], ignore_index=True).reindex(columns=ARTICLE_COLS)
+    res["word_count"] = pd.to_numeric(res["word_count"], errors="coerce")
+    return res
 
 
 # ─────────────────────────────────────────────
@@ -172,7 +174,10 @@ def annotate_all(articles: pd.DataFrame, festival: str, api_key: str,
         rows.append({"url_key": r.url_key, "model": model,
                      "annotated_at": datetime.now().isoformat(timespec="seconds"), **res})
         time.sleep(delay)
-    return pd.concat([existing, pd.DataFrame(rows)], ignore_index=True).reindex(columns=ANNOT_COLS)
+    res = pd.concat([d for d in (existing, pd.DataFrame(rows)) if not d.empty],
+                    ignore_index=True).reindex(columns=ANNOT_COLS)
+    res["sentiment_score"] = pd.to_numeric(res["sentiment_score"], errors="coerce")
+    return res
 
 
 # ─────────────────────────────────────────────

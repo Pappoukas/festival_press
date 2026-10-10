@@ -142,6 +142,9 @@ has_text = articles is not None and "text" in df and df["text"].notna().any()
 if annots is not None:
     df = df.merge(annots, on="url_key", how="left")
 has_annot = annots is not None and "sentiment_label" in df and df["sentiment_label"].notna().any()
+for _c in ("word_count", "sentiment_score"):
+    if _c in df:
+        df[_c] = pd.to_numeric(df[_c], errors="coerce")
 
 periods = sorted(df.period.unique())
 sel_periods = st.sidebar.multiselect("Περίοδοι", periods, default=periods)
@@ -158,6 +161,15 @@ st.sidebar.markdown(
     f"**Κείμενα:** {'✅ ' + str(int((articles.status == 'ok').sum())) + ' άρθρα' if articles is not None else '— (βλ. Εμπλουτισμός)'}\n\n"
     f"**Επισημείωση LLM:** {'✅ ' + str(len(annots)) + ' άρθρα' if annots is not None else '—'}"
 )
+if "articles" in st.session_state or "annotations" in st.session_state:
+    st.sidebar.warning("Τα δεδομένα εμπλουτισμού αυτής της συνεδρίας δεν είναι ακόμη στο repo. "
+                       "Κατεβάστε τα και ανεβάστε τα στον φάκελο data/.")
+    if "articles" in st.session_state:
+        st.sidebar.download_button("💾 articles.csv", st.session_state["articles"].to_csv(index=False).encode("utf-8"),
+                                   file_name="articles.csv", width="stretch", key="dl_art_side")
+    if "annotations" in st.session_state:
+        st.sidebar.download_button("💾 annotations.csv", st.session_state["annotations"].to_csv(index=False).encode("utf-8"),
+                                   file_name="annotations.csv", width="stretch", key="dl_ann_side")
 st.sidebar.markdown("**Απεικόνιση:** Καλλίνικος Κωνσταντίνος")
 
 # ─────────────────────────────────────────────
@@ -617,6 +629,10 @@ with st.expander("⚙️ Εμπλουτισμός δεδομένων (λήψη �
             res = fetch_all(clips, existing=articles, retry_failed=retry,
                             progress=lambda i, n, u: bar.progress(i / max(n, 1), f"{i}/{n} · {u[:60]}"))
             st.session_state["articles"] = res
+            try:
+                res.to_csv(ARTICLES_FILE, index=False)
+            except OSError:
+                pass
             st.rerun()
         if articles is not None:
             st.download_button("💾 articles.csv", articles.to_csv(index=False).encode("utf-8"),
@@ -636,6 +652,10 @@ with st.expander("⚙️ Εμπλουτισμός δεδομένων (λήψη �
             res = annotate_all(articles, title or "Φεστιβάλ", key, model=model, delay=delay, existing=annots,
                                progress=lambda i, n, u: bar.progress(i / max(n, 1), f"{i}/{n} · {u[:60]}"))
             st.session_state["annotations"] = res
+            try:
+                res.to_csv(ANNOT_FILE, index=False)
+            except OSError:
+                pass
             st.rerun()
         if annots is not None:
             st.download_button("💾 annotations.csv", annots.to_csv(index=False).encode("utf-8"),
