@@ -3,11 +3,13 @@ enrich.py — Εμπλουτισμός της αποδελτίωσης με το
 
 Βήματα (επαναλήψιμα· ό,τι έχει ήδη γίνει παραλείπεται):
   1. fetch     → data/articles.csv     (τίτλος, κείμενο, ημ/νία μεταδεδομένων, λέξεις)
-  2. annotate  → data/annotations.csv  (sentiment, θεματικές, είδος κειμένου, περίληψη) με Gemini
+  2. annotate  → data/annotations.csv  (sentiment, θεματικές, είδος κειμένου, περίληψη) με LLM
 
 Χρήση από γραμμή εντολών (π.χ. στον τοπικό server):
   python enrich.py fetch
-  GEMINI_API_KEY=... python enrich.py annotate --model gemini-2.5-flash-lite --delay 6
+  MISTRAL_API_KEY=... python enrich.py annotate                     (προεπιλογή: Mistral)
+  GROQ_API_KEY=...    python enrich.py annotate --provider groq
+  python enrich.py annotate --provider ollama --model qwen2.5:7b    (τοπικά, χωρίς κλειδί)
 Μετά: commit των δύο CSV στο repo ώστε να τα διαβάζει η εφαρμογή στο Streamlit Cloud.
 """
 from __future__ import annotations
@@ -102,7 +104,8 @@ def fetch_all(clips: pd.DataFrame, existing: pd.DataFrame | None = None, delay: 
         if r.url:
             time.sleep(delay)
     out.append(pd.DataFrame(rows))
-    res = pd.concat([o for o in out if not o.empty], ignore_index=True).reindex(columns=ARTICLE_COLS)
+    parts = [o for o in out if not o.empty]
+    res = (pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()).reindex(columns=ARTICLE_COLS)
     res["word_count"] = pd.to_numeric(res["word_count"], errors="coerce")
     return res
 
@@ -128,54 +131,138 @@ def build_prompt(festival: str, themes: list[str], title: str, text: str) -> str
 
 ΤΙΤΛΟΣ: {title}
 ΚΕΙΜΕΝΟ:
-{text[:12000]}
+{text}
 """
 
 
-def annotate_one(client, model: str, prompt: str) -> dict:
+# Πάροχοι με δωρεάν πρόσβαση. Όλοι εκτός του Gemini μιλούν το πρότυπο «OpenAI chat completions».
+# Τα όρια αλλάζουν συχνά· η καθυστέρηση (delay) είναι συντηρητική για free tier.
+PROVIDERS = {
+    "Mistral (δωρεάν Experiment)": dict(
+        kind="openai", base_url="https://api.mistral.ai/v1", key_env="MISTRAL_API_KEY",
+        model="mistral-small-latest", delay=2.0, max_chars=12000,
+        note="Ευρωπαϊκός πάροχος, πολύ καλά ελληνικά. ~1 αίτημα/δευτ., πολύ μεγάλο μηνιαίο όριο tokens. "
+             "Κλειδί: console.mistral.ai (χωρίς κάρτα, επιβεβαίωση κινητού)."),
+    "Groq (δωρεάν)": dict(
+        kind="openai", base_url="https://api.groq.com/openai/v1", key_env="GROQ_API_KEY",
+        model="llama-3.3-70b-versatile", delay=12.0, max_chars=6000,
+        note="Πολύ γρήγορο. ~30 αιτήματα/λεπτό και ~1.000/ημέρα, αλλά χαμηλό όριο tokens/λεπτό — "
+             "τα ελληνικά «κοστίζουν» πολλά tokens, γι' αυτό κόβεται το κείμενο και υπάρχει καθυστέρηση. "
+             "Κλειδί: console.groq.com."),
+    "OpenRouter (μοντέλα :free)": dict(
+        kind="openai", base_url="https://openrouter.ai/api/v1", key_env="OPENROUTER_API_KEY",
+        model="meta-llama/llama-3.3-70b-instruct:free", delay=4.0, max_chars=10000,
+        note="Πολλά δωρεάν μοντέλα, αλλά μόνο ~50 αιτήματα/ημέρα χωρίς αγορά credits — "
+             "το corpus θέλει 4–5 ημέρες. Κλειδί: openrouter.ai."),
+    "Ollama (τοπικά, στον server)": dict(
+        kind="openai", base_url="http://localhost:11434/v1", key_env=None,
+        model="qwen2.5:7b", delay=0.0, max_chars=8000,
+        note="Εντελώς δωρεάν και ιδιωτικό, χωρίς όρια — αλλά αργό σε CPU (λεπτά ανά άρθρο). "
+             "Μόνο από γραμμή εντολών στον δικό σας server, όχι από το Streamlit Cloud."),
+    "Gemini (δωρεάν)": dict(
+        kind="gemini", base_url=None, key_env="GEMINI_API_KEY",
+        model="gemini-2.5-flash-lite", delay=6.0, max_chars=12000,
+        note="Free tier με ημερήσιο όριο αιτημάτων ανά μοντέλο."),
+}
+DEFAULT_PROVIDER = "Mistral (δωρεάν Experiment)"
+
+
+def _parse_json(raw: str) -> dict:
+    raw = (raw or "").strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        a, b = raw.find("{"), raw.rfind("}")
+        return json.loads(raw[a:b + 1])
+
+
+def _call_openai_compatible(cfg: dict, api_key: str | None, model: str, prompt: str,
+                            max_retries: int = 5) -> str:
+    import requests
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    body = {"model": model, "temperature": 0.1,
+            "response_format": {"type": "json_object"},
+            "messages": [{"role": "system", "content": "Απαντάς πάντα μόνο με έγκυρο JSON."},
+                         {"role": "user", "content": prompt}]}
+    for attempt in range(max_retries):
+        r = requests.post(f"{cfg['base_url']}/chat/completions", headers=headers, json=body, timeout=300)
+        if r.status_code == 429 or r.status_code >= 500:   # όριο ρυθμού ή προσωρινό σφάλμα → αναμονή
+            wait = float(r.headers.get("retry-after", 0) or 0) or min(60, 10 * 2 ** attempt)
+            time.sleep(wait)
+            continue
+        if r.status_code == 400 and "response_format" in r.text:   # μοντέλο χωρίς JSON mode
+            body.pop("response_format", None)
+            continue
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    raise RuntimeError(f"Εξαντλήθηκαν οι επαναλήψεις ({r.status_code})")
+
+
+def _call_gemini(api_key: str, model: str, prompt: str) -> str:
+    from google import genai
     from google.genai import types
+    client = genai.Client(api_key=api_key)
     resp = client.models.generate_content(
         model=model, contents=prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1),
-    )
-    raw = (resp.text or "").strip().removeprefix("```json").removesuffix("```").strip()
-    j = json.loads(raw)
-    label = j.get("sentiment_label", "ουδέτερο")
+        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1))
+    return resp.text
+
+
+def annotate_one(provider: str, api_key: str | None, model: str, prompt: str) -> dict:
+    cfg = PROVIDERS[provider]
+    raw = (_call_gemini(api_key, model, prompt) if cfg["kind"] == "gemini"
+           else _call_openai_compatible(cfg, api_key, model, prompt))
+    j = _parse_json(raw)
+    label = str(j.get("sentiment_label", "ουδέτερο")).strip().lower()
+    try:
+        score = max(-1.0, min(1.0, float(j.get("sentiment_score", 0) or 0)))
+    except (TypeError, ValueError):
+        score = 0.0
+    as_list = lambda v: v if isinstance(v, list) else ([v] if v else [])
     return {
         "sentiment_label": label if label in SENTIMENT_LABELS else "ουδέτερο",
-        "sentiment_score": float(j.get("sentiment_score", 0) or 0),
-        "themes_llm": "|".join(j.get("themes") or []),
+        "sentiment_score": score,
+        "themes_llm": "|".join(map(str, as_list(j.get("themes")))),
         "article_type": j.get("article_type", ""),
         "summary": j.get("summary", ""),
-        "persons": "|".join(j.get("persons") or []),
+        "persons": "|".join(map(str, as_list(j.get("persons")))),
     }
 
 
-def annotate_all(articles: pd.DataFrame, festival: str, api_key: str,
-                 model: str = "gemini-2.5-flash-lite", delay: float = 6.0,
-                 existing: pd.DataFrame | None = None, min_words: int = 40,
+def annotate_all(articles: pd.DataFrame, festival: str, api_key: str | None,
+                 provider: str = DEFAULT_PROVIDER, model: str | None = None,
+                 delay: float | None = None, existing: pd.DataFrame | None = None,
+                 min_words: int = 40,
                  progress: Callable[[int, int, str], None] | None = None) -> pd.DataFrame:
-    from google import genai
-    client = genai.Client(api_key=api_key)
+    cfg = PROVIDERS[provider]
+    model = model or cfg["model"]
+    delay = cfg["delay"] if delay is None else delay
     themes = pd.read_csv(THEMES)["theme"].tolist()
     existing = existing if existing is not None else _load(ANNOTATIONS, ANNOT_COLS)
-    ok = articles[(articles.status == "ok") & (articles.word_count >= min_words)]
+    wc = pd.to_numeric(articles.word_count, errors="coerce")
+    ok = articles[(articles.status == "ok") & (wc >= min_words)]
     todo = ok[~ok.url_key.isin(existing.url_key)]
-    rows = []
+    rows, errors = [], 0
     for i, r in enumerate(todo.itertuples(), 1):
         if progress:
             progress(i, len(todo), r.url)
+        prompt = build_prompt(festival, themes, r.title or "", str(r.text)[:cfg["max_chars"]])
         try:
-            res = annotate_one(client, model, build_prompt(festival, themes, r.title or "", r.text))
+            res = annotate_one(provider, api_key, model, prompt)
         except Exception as e:  # noqa: BLE001 — συνεχίζουμε· θα ξαναδοκιμαστεί στο επόμενο τρέξιμο
-            print(f"  ! {r.url}: {type(e).__name__}: {e}")
+            errors += 1
+            print(f"  ! {r.url}: {type(e).__name__}: {str(e)[:200]}")
+            if errors >= 10 and not rows:
+                raise RuntimeError(f"Συνεχόμενα σφάλματα — ελέγξτε κλειδί/μοντέλο: {e}") from e
             time.sleep(delay)
             continue
-        rows.append({"url_key": r.url_key, "model": model,
+        rows.append({"url_key": r.url_key, "model": f"{provider.split(' ')[0]}:{model}",
                      "annotated_at": datetime.now().isoformat(timespec="seconds"), **res})
         time.sleep(delay)
-    res = pd.concat([d for d in (existing, pd.DataFrame(rows)) if not d.empty],
-                    ignore_index=True).reindex(columns=ANNOT_COLS)
+    parts = [d for d in (existing, pd.DataFrame(rows)) if not d.empty]
+    res = (pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()).reindex(columns=ANNOT_COLS)
     res["sentiment_score"] = pd.to_numeric(res["sentiment_score"], errors="coerce")
     return res
 
@@ -220,7 +307,9 @@ def main():
     ap.add_argument("step", choices=["fetch", "annotate"])
     ap.add_argument("--docx", default=str(DOCX))
     ap.add_argument("--delay", type=float, default=None)
-    ap.add_argument("--model", default=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"))
+    ap.add_argument("--provider", default="mistral",
+                    choices=["mistral", "groq", "openrouter", "ollama", "gemini"])
+    ap.add_argument("--model", default=None, help="Παράκαμψη του προεπιλεγμένου μοντέλου του παρόχου")
     ap.add_argument("--retry-failed", action="store_true")
     a = ap.parse_args()
 
@@ -231,12 +320,14 @@ def main():
         df.to_csv(ARTICLES, index=False)
         print(df.status.value_counts())
     else:
-        key = os.getenv("GEMINI_API_KEY")
-        if not key:
-            raise SystemExit("Ορίστε GEMINI_API_KEY στο περιβάλλον.")
+        provider = next(p for p in PROVIDERS if p.lower().startswith(a.provider))
+        cfg = PROVIDERS[provider]
+        key = os.getenv(cfg["key_env"]) if cfg["key_env"] else None
+        if cfg["key_env"] and not key:
+            raise SystemExit(f"Ορίστε {cfg['key_env']} στο περιβάλλον.")
         arts = _load(ARTICLES, ARTICLE_COLS)
-        df = annotate_all(arts, title or "Φεστιβάλ", key, model=a.model,
-                          delay=a.delay if a.delay is not None else 6.0, progress=_cli_progress)
+        df = annotate_all(arts, title or "Φεστιβάλ", key, provider=provider, model=a.model,
+                          delay=a.delay, progress=_cli_progress)
         df.to_csv(ANNOTATIONS, index=False)
         print(df.sentiment_label.value_counts())
 

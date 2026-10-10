@@ -405,12 +405,12 @@ st.divider()
 # ═════════════════════════════════════════════
 st.subheader("🏷️ Θεματικές")
 themes = load_themes(THEMES_FILE)
-sources = ["Λέξεις-κλειδιά"] + (["Gemini (LLM)"] if has_annot else [])
+sources = ["Λέξεις-κλειδιά"] + (["LLM"] if has_annot else [])
 th_src = st.radio("Μέθοδος", sources, horizontal=True,
                   help="Λέξεις-κλειδιά: λεξικό στο data/themes.csv, εφαρμόζεται στο κείμενο ή — όπου "
-                       "δεν υπάρχει — στον τίτλο/URL. Gemini: θεματικές που απέδωσε το μοντέλο.")
+                       "δεν υπάρχει — στον τίτλο/URL. LLM: θεματικές που απέδωσε το γλωσσικό μοντέλο.")
 tdf = fdf.copy()
-if th_src.startswith("Gemini"):
+if th_src == "LLM":
     tdf["themes_list"] = tdf.themes_llm.fillna("").map(lambda s: [t for t in s.split("|") if t])
     tdf = tdf[tdf.sentiment_label.notna()]
 else:
@@ -483,7 +483,7 @@ st.divider()
 # ═════════════════════════════════════════════
 st.subheader("💬 Sentiment & Είδος Κάλυψης")
 if not has_annot:
-    st.info("Η ανάλυση συναισθήματος γίνεται με Gemini πάνω στα κείμενα, με οδηγία να κρίνεται η "
+    st.info("Η ανάλυση συναισθήματος γίνεται με γλωσσικό μοντέλο (Mistral, Groq κ.ά.) πάνω στα κείμενα, με οδηγία να κρίνεται η "
             "στάση απέναντι στο φεστιβάλ και όχι το θέμα (το «Κόσμοι σε σύγκρουση» θα έδινε ψευδώς "
             "αρνητικά αποτελέσματα με απλό λεξικό). Δείτε «⚙️ Εμπλουτισμός δεδομένων».")
 else:
@@ -581,9 +581,10 @@ def build_report() -> str:
         L.append(f"  - {t}: {n} ({n / len(tdf) * 100:.0f}%)")
     if has_annot:
         sdd = fdf[fdf.sentiment_label.notna()]
+        L.append(f"- Μοντέλο επισημείωσης: {', '.join(sorted(sdd.model.dropna().unique()))}")
         L.append(f"- Sentiment (n={len(sdd)}): μέσο σκορ {sdd.sentiment_score.mean():+.2f}· " +
                  ", ".join(f"{k} {v:.0f}%" for k, v in sdd.sentiment_label.value_counts(normalize=True).mul(100).items()))
-    L += ["", "---", "*Μεθοδολογία: αποδελτίωση .docx · θεματικές με λεξικό λέξεων-κλειδιών ή Gemini · "
+    L += ["", "---", "*Μεθοδολογία: αποδελτίωση .docx · θεματικές με λεξικό λέξεων-κλειδιών ή LLM · "
           "sentiment ως στάση απέναντι στη διοργάνωση.*"]
     return "\n".join(L)
 
@@ -612,13 +613,13 @@ st.divider()
 # ═════════════════════════════════════════════
 # 7. ΕΜΠΛΟΥΤΙΣΜΟΣ ΔΕΔΟΜΕΝΩΝ
 # ═════════════════════════════════════════════
-with st.expander("⚙️ Εμπλουτισμός δεδομένων (λήψη κειμένων & επισημείωση Gemini)"):
+with st.expander("⚙️ Εμπλουτισμός δεδομένων (λήψη κειμένων & επισημείωση LLM)"):
     st.markdown(
         "Προτεινόμενη ροή: εκτέλεση **τοπικά** με `python enrich.py fetch` και "
-        "`python enrich.py annotate`, και commit των `data/articles.csv` / `data/annotations.csv`. "
+        "`python enrich.py annotate --provider mistral`, και commit των `data/articles.csv` / `data/annotations.csv`. "
         "Εναλλακτικά από εδώ — τα αποτελέσματα κρατιούνται μόνο για την τρέχουσα συνεδρία, "
         "οπότε κατεβάστε τα CSV και ανεβάστε τα στο repo.")
-    from enrich import annotate_all, fetch_all
+    from enrich import PROVIDERS, annotate_all, fetch_all
 
     a1, a2 = st.columns(2)
     with a1:
@@ -638,19 +639,32 @@ with st.expander("⚙️ Εμπλουτισμός δεδομένων (λήψη �
             st.download_button("💾 articles.csv", articles.to_csv(index=False).encode("utf-8"),
                                file_name="articles.csv", width="stretch")
     with a2:
-        st.markdown("**2. Επισημείωση** (Gemini)")
+        st.markdown("**2. Επισημείωση** (LLM)")
+        prov = st.selectbox("Πάροχος", [p for p in PROVIDERS if not p.startswith("Ollama")],
+                            help="Το Ollama τρέχει μόνο τοπικά: python enrich.py annotate --provider ollama")
+        cfg = PROVIDERS[prov]
+        st.caption(cfg["note"])
         try:
-            key = st.secrets["GEMINI_API_KEY"]
+            key = st.secrets[cfg["key_env"]]
         except Exception:  # noqa: BLE001
             key = ""
-        key = key or st.text_input("GEMINI_API_KEY", type="password")
-        model = st.text_input("Μοντέλο", "gemini-2.5-flash-lite")
-        delay = st.number_input("Καθυστέρηση ανά αίτημα (δευτ.)", 0.0, 30.0, 6.0, 0.5,
-                                help="Free tier: ~10–15 αιτήματα/λεπτό.")
+        key = key or st.text_input(cfg["key_env"], type="password", key=f"key_{cfg['key_env']}")
+        model = st.text_input("Μοντέλο", cfg["model"], key=f"model_{prov}")
+        delay = st.number_input("Καθυστέρηση ανά αίτημα (δευτ.)", 0.0, 60.0, float(cfg["delay"]), 0.5,
+                                key=f"delay_{prov}")
+        if annots is not None and annots.model.notna().any():
+            used = sorted(annots.model.dropna().unique())
+            st.caption(f"Ήδη επισημειωμένα με: {', '.join(used)}. Για συγκρίσιμα αποτελέσματα "
+                       "καλό είναι όλο το corpus να επισημειωθεί με το ίδιο μοντέλο.")
         if st.button("▶️ Επισημείωση", width="stretch", disabled=not (key and articles is not None)):
             bar = st.progress(0.0, "Έναρξη…")
-            res = annotate_all(articles, title or "Φεστιβάλ", key, model=model, delay=delay, existing=annots,
-                               progress=lambda i, n, u: bar.progress(i / max(n, 1), f"{i}/{n} · {u[:60]}"))
+            try:
+                res = annotate_all(articles, title or "Φεστιβάλ", key, provider=prov, model=model,
+                                   delay=delay, existing=annots,
+                                   progress=lambda i, n, u: bar.progress(i / max(n, 1), f"{i}/{n} · {u[:60]}"))
+            except RuntimeError as e:
+                st.error(str(e))
+                st.stop()
             st.session_state["annotations"] = res
             try:
                 res.to_csv(ANNOT_FILE, index=False)

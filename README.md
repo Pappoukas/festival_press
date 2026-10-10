@@ -8,14 +8,14 @@
 | ⏱️ Χρονική κατανομή (ημέρα, εβδομάδα, σωρευτικά, ανά Δ.Τ., ημέρα εβδομάδας) | ✅ | ✅ | ✅ |
 | 📰 Μέσα, κατηγορίες, εμβέλεια, Gini/Lorenz | ✅ | ✅ | ✅ |
 | 📝 Αριθμός λέξεων, αναδημοσιεύσεις Δ.Τ. (ομοιότητα κειμένων) | — | ✅ | ✅ |
-| 🏷️ Θεματικές (λεξικό) | από URL | από κείμενο | + Gemini |
+| 🏷️ Θεματικές (λεξικό) | από URL | από κείμενο | + LLM |
 | 💬 Sentiment, είδος κειμένου, πρόσωπα, περιλήψεις | — | — | ✅ |
 | 📋 Εξαγωγή Excel / Markdown / CSV | ✅ | ✅ | ✅ |
 
 ## Αρχεία
 - `app.py` — η εφαρμογή
 - `clippings.py` — ανάγνωση του .docx, ημερομηνίες, περίοδοι, θεματικές
-- `enrich.py` — λήψη κειμένων (trafilatura) & επισημείωση (Gemini)
+- `enrich.py` — λήψη κειμένων (trafilatura) & επισημείωση με LLM (Mistral, Groq, OpenRouter, Ollama, Gemini)
 - `data/Publicity5thCBF.docx` — η αποδελτίωση
 - `data/outlets.csv` — μέσο → κατηγορία & εμβέλεια (**επεξεργάσιμο**· `verify=1` = προς έλεγχο)
 - `data/themes.csv` — θεματικές & λέξεις-κλειδιά (χωρίς τόνους, ως αρχή λέξης· και greeklish για τα URL)
@@ -25,8 +25,11 @@
 ```bash
 pip install -r requirements.txt
 python enrich.py fetch                      # ~5 λεπτά, γράφει data/articles.csv
-export GEMINI_API_KEY=...
-python enrich.py annotate --delay 6         # free tier: ~25–30 λεπτά για ~210 άρθρα
+export MISTRAL_API_KEY=...
+python enrich.py annotate                   # Mistral free: ~10–15 λεπτά για ~210 άρθρα
+# εναλλακτικά:
+#   GROQ_API_KEY=...  python enrich.py annotate --provider groq
+#   python enrich.py annotate --provider ollama --model qwen2.5:7b   (τοπικά, χωρίς κλειδί)
 git add data/*.csv && git commit -m "enrichment" && git push
 streamlit run app.py
 ```
@@ -41,3 +44,15 @@ streamlit run app.py
 - **Sentiment**: στάση απέναντι στη διοργάνωση, όχι στο θέμα — το «Κόσμοι σε σύγκρουση» θα έδινε
   ψευδώς αρνητικά αποτελέσματα με λεξικό. Προτείνεται ανθρώπινος έλεγχος δείγματος.
 - **Αναδημοσίευση**: μέγιστη ομοιότητα συνημιτόνου (TF-IDF χαρακτήρων 3–5) με άλλο κείμενο ≥ κατώφλι.
+
+## Δωρεάν πάροχοι για την επισημείωση
+| Πάροχος | Κλειδί (secrets) | Προεπιλεγμένο μοντέλο | Σχόλιο |
+|---|---|---|---|
+| **Mistral** (προεπιλογή) | `MISTRAL_API_KEY` | mistral-small-latest | Ευρωπαϊκός, καλά ελληνικά, ~1 αίτημα/δευτ. |
+| Groq | `GROQ_API_KEY` | llama-3.3-70b-versatile | Πολύ γρήγορο, χαμηλό όριο tokens/λεπτό |
+| OpenRouter | `OPENROUTER_API_KEY` | …:free | ~50 αιτήματα/ημέρα χωρίς credits |
+| Ollama | — | qwen2.5:7b | Τοπικά, ιδιωτικό, αργό σε CPU |
+| Gemini | `GEMINI_API_KEY` | gemini-2.5-flash-lite | Ημερήσιο όριο ανά μοντέλο |
+
+Η στήλη `model` στο `annotations.csv` καταγράφει πάροχο και μοντέλο ανά άρθρο. Για συγκρίσιμα
+αποτελέσματα, επισημειώστε όλο το corpus με το ίδιο μοντέλο.
