@@ -145,10 +145,10 @@ PROVIDERS = {
              "Κλειδί: console.mistral.ai (χωρίς κάρτα, επιβεβαίωση κινητού)."),
     "Groq (δωρεάν)": dict(
         kind="openai", base_url="https://api.groq.com/openai/v1", key_env="GROQ_API_KEY",
-        model="llama-3.3-70b-versatile", delay=12.0, max_chars=6000,
+        model="openai/gpt-oss-120b", delay=12.0, max_chars=6000,
         note="Πολύ γρήγορο. ~30 αιτήματα/λεπτό και ~1.000/ημέρα, αλλά χαμηλό όριο tokens/λεπτό — "
              "τα ελληνικά «κοστίζουν» πολλά tokens, γι' αυτό κόβεται το κείμενο και υπάρχει καθυστέρηση. "
-             "Κλειδί: console.groq.com."),
+             "Αν πιάνετε το όριο, δοκιμάστε openai/gpt-oss-20b. Κλειδί: console.groq.com."),
     "OpenRouter (μοντέλα :free)": dict(
         kind="openai", base_url="https://openrouter.ai/api/v1", key_env="OPENROUTER_API_KEY",
         model="meta-llama/llama-3.3-70b-instruct:free", delay=4.0, max_chars=10000,
@@ -165,6 +165,40 @@ PROVIDERS = {
         note="Free tier με ημερήσιο όριο αιτημάτων ανά μοντέλο."),
 }
 DEFAULT_PROVIDER = "Mistral (δωρεάν Experiment)"
+
+
+class FatalAPIError(RuntimeError):
+    """Σφάλμα που δεν διορθώνεται με επανάληψη (λάθος κλειδί, ανύπαρκτο/αποσυρμένο μοντέλο)."""
+
+
+def _api_message(r) -> str:
+    try:
+        j = r.json()
+        e = j.get("error", j)
+        return (e.get("message") if isinstance(e, dict) else str(e)) or r.text[:300]
+    except ValueError:
+        return r.text[:300]
+
+
+def list_models(provider: str, api_key: str | None) -> list[str]:
+    """Τα μοντέλα που είναι ενεργά τώρα στον πάροχο (μέσω του endpoint /models)."""
+    import requests
+    cfg = PROVIDERS[provider]
+    if cfg["kind"] == "gemini":
+        from google import genai
+        return sorted(m.name.removeprefix("models/") for m in genai.Client(api_key=api_key).models.list()
+                      if "generateContent" in (m.supported_actions or []))
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    r = requests.get(f"{cfg['base_url']}/models", headers=headers, timeout=30)
+    if r.status_code != 200:
+        raise FatalAPIError(f"{r.status_code}: {_api_message(r)}")
+    data = r.json().get("data", [])
+    ids = [m["id"] for m in data if m.get("active", True)]
+    if provider.startswith("OpenRouter"):
+        ids = [i for i in ids if i.endswith(":free")]
+    # χωρίς μοντέλα ήχου/ενσωματώσεων/ασφαλείας
+    skip = ("whisper", "embed", "tts", "guard", "moderation", "orpheus", "ocr", "transcribe")
+    return sorted(i for i in ids if not any(k in i.lower() for k in skip))
 
 
 def _parse_json(raw: str) -> dict:
@@ -186,8 +220,15 @@ def _call_openai_compatible(cfg: dict, api_key: str | None, model: str, prompt: 
             "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": "Απαντάς πάντα μόνο με έγκυρο JSON."},
                          {"role": "user", "content": prompt}]}
+    if "gpt-oss" in model or "qwen3" in model:   # μοντέλα συλλογισμού: λιγότερα tokens σκέψης
+        body["reasoning_effort"] = "low"
     for attempt in range(max_retries):
         r = requests.post(f"{cfg['base_url']}/chat/completions", headers=headers, json=body, timeout=300)
+        if r.status_code in (401, 403, 404):
+            raise FatalAPIError(f"{r.status_code}: {_api_message(r)}")
+        if r.status_code == 400 and "reasoning_effort" in r.text:
+            body.pop("reasoning_effort", None)
+            continue
         if r.status_code == 429 or r.status_code >= 500:   # όριο ρυθμού ή προσωρινό σφάλμα → αναμονή
             wait = float(r.headers.get("retry-after", 0) or 0) or min(60, 10 * 2 ** attempt)
             time.sleep(wait)
@@ -195,7 +236,8 @@ def _call_openai_compatible(cfg: dict, api_key: str | None, model: str, prompt: 
         if r.status_code == 400 and "response_format" in r.text:   # μοντέλο χωρίς JSON mode
             body.pop("response_format", None)
             continue
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise RuntimeError(f"{r.status_code}: {_api_message(r)}")
         return r.json()["choices"][0]["message"]["content"]
     raise RuntimeError(f"Εξαντλήθηκαν οι επαναλήψεις ({r.status_code})")
 
@@ -251,6 +293,8 @@ def annotate_all(articles: pd.DataFrame, festival: str, api_key: str | None,
         prompt = build_prompt(festival, themes, r.title or "", str(r.text)[:cfg["max_chars"]])
         try:
             res = annotate_one(provider, api_key, model, prompt)
+        except FatalAPIError:
+            raise
         except Exception as e:  # noqa: BLE001 — συνεχίζουμε· θα ξαναδοκιμαστεί στο επόμενο τρέξιμο
             errors += 1
             print(f"  ! {r.url}: {type(e).__name__}: {str(e)[:200]}")

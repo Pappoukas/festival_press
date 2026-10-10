@@ -619,7 +619,7 @@ with st.expander("⚙️ Εμπλουτισμός δεδομένων (λήψη �
         "`python enrich.py annotate --provider mistral`, και commit των `data/articles.csv` / `data/annotations.csv`. "
         "Εναλλακτικά από εδώ — τα αποτελέσματα κρατιούνται μόνο για την τρέχουσα συνεδρία, "
         "οπότε κατεβάστε τα CSV και ανεβάστε τα στο repo.")
-    from enrich import PROVIDERS, annotate_all, fetch_all
+    from enrich import PROVIDERS, FatalAPIError, annotate_all, fetch_all, list_models
 
     a1, a2 = st.columns(2)
     with a1:
@@ -649,7 +649,22 @@ with st.expander("⚙️ Εμπλουτισμός δεδομένων (λήψη �
         except Exception:  # noqa: BLE001
             key = ""
         key = key or st.text_input(cfg["key_env"], type="password", key=f"key_{cfg['key_env']}")
-        model = st.text_input("Μοντέλο", cfg["model"], key=f"model_{prov}")
+        mkey = f"models_{prov}"
+        if st.button("🔄 Έλεγχος διαθέσιμων μοντέλων", width="stretch", disabled=not key):
+            try:
+                st.session_state[mkey] = list_models(prov, key)
+            except Exception as e:  # noqa: BLE001
+                st.error(f"Δεν ήταν δυνατή η λίστα μοντέλων — {e}")
+        available = st.session_state.get(mkey)
+        if available:
+            idx = available.index(cfg["model"]) if cfg["model"] in available else 0
+            model = st.selectbox(f"Μοντέλο ({len(available)} διαθέσιμα)", available, index=idx,
+                                 key=f"model_sel_{prov}")
+            if cfg["model"] not in available:
+                st.warning(f"Το προεπιλεγμένο «{cfg['model']}» δεν είναι πλέον διαθέσιμο· επιλέξτε άλλο.")
+        else:
+            model = st.text_input("Μοντέλο", cfg["model"], key=f"model_{prov}",
+                                  help="Πατήστε «Έλεγχος διαθέσιμων μοντέλων» για τη λίστα του παρόχου.")
         delay = st.number_input("Καθυστέρηση ανά αίτημα (δευτ.)", 0.0, 60.0, float(cfg["delay"]), 0.5,
                                 key=f"delay_{prov}")
         if annots is not None and annots.model.notna().any():
@@ -662,6 +677,12 @@ with st.expander("⚙️ Εμπλουτισμός δεδομένων (λήψη �
                 res = annotate_all(articles, title or "Φεστιβάλ", key, provider=prov, model=model,
                                    delay=delay, existing=annots,
                                    progress=lambda i, n, u: bar.progress(i / max(n, 1), f"{i}/{n} · {u[:60]}"))
+            except FatalAPIError as e:
+                msg = str(e)
+                hint = ("Το κλειδί δεν έγινε δεκτό." if msg.startswith(("401", "403"))
+                        else "Το μοντέλο δεν υπάρχει ή έχει αποσυρθεί — πατήστε «Έλεγχος διαθέσιμων μοντέλων».")
+                st.error(f"{hint}\n\nΑπάντηση παρόχου: {msg}")
+                st.stop()
             except RuntimeError as e:
                 st.error(str(e))
                 st.stop()
