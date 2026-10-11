@@ -273,19 +273,41 @@ def annotate_one(provider: str, api_key: str | None, model: str, prompt: str) ->
     }
 
 
+def annotatable(articles: pd.DataFrame, min_words: int = 40) -> pd.DataFrame:
+    """Τα άρθρα που μπορούν να επισημειωθούν (ανακτήθηκαν και έχουν αρκετό κείμενο)."""
+    wc = pd.to_numeric(articles.word_count, errors="coerce")
+    return articles[(articles.status == "ok") & (wc >= min_words)]
+
+
+def _merge_annotations(existing: pd.DataFrame, rows: list[dict]) -> pd.DataFrame:
+    parts = [d for d in (existing, pd.DataFrame(rows)) if not d.empty]
+    res = (pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()).reindex(columns=ANNOT_COLS)
+    res = res.drop_duplicates("url_key", keep="last").reset_index(drop=True)
+    res["sentiment_score"] = pd.to_numeric(res["sentiment_score"], errors="coerce")
+    return res
+
+
 def annotate_all(articles: pd.DataFrame, festival: str, api_key: str | None,
                  provider: str = DEFAULT_PROVIDER, model: str | None = None,
                  delay: float | None = None, existing: pd.DataFrame | None = None,
-                 min_words: int = 40,
+                 min_words: int = 40, limit: int | None = None,
+                 checkpoint: Callable[[pd.DataFrame], None] | None = None,
                  progress: Callable[[int, int, str], None] | None = None) -> pd.DataFrame:
+    """
+    Επισημειώνει τα άρθρα που δεν έχουν ακόμη επισημείωση.
+    limit:      πόσα το πολύ σε αυτό το τρέξιμο (π.χ. 10 = μία παρτίδα)
+    checkpoint: καλείται μετά από ΚΑΘΕ επιτυχημένο άρθρο με τον πλήρη πίνακα,
+                ώστε μια διακοπή να μη χάνει δουλειά.
+    """
     cfg = PROVIDERS[provider]
     model = model or cfg["model"]
     delay = cfg["delay"] if delay is None else delay
     themes = pd.read_csv(THEMES)["theme"].tolist()
     existing = existing if existing is not None else _load(ANNOTATIONS, ANNOT_COLS)
-    wc = pd.to_numeric(articles.word_count, errors="coerce")
-    ok = articles[(articles.status == "ok") & (wc >= min_words)]
+    ok = annotatable(articles, min_words)
     todo = ok[~ok.url_key.isin(existing.url_key)]
+    if limit:
+        todo = todo.head(limit)
     rows, errors = [], 0
     for i, r in enumerate(todo.itertuples(), 1):
         if progress:
@@ -298,17 +320,86 @@ def annotate_all(articles: pd.DataFrame, festival: str, api_key: str | None,
         except Exception as e:  # noqa: BLE001 — συνεχίζουμε· θα ξαναδοκιμαστεί στο επόμενο τρέξιμο
             errors += 1
             print(f"  ! {r.url}: {type(e).__name__}: {str(e)[:200]}")
-            if errors >= 10 and not rows:
+            if errors >= 5 and not rows:
                 raise RuntimeError(f"Συνεχόμενα σφάλματα — ελέγξτε κλειδί/μοντέλο: {e}") from e
             time.sleep(delay)
             continue
         rows.append({"url_key": r.url_key, "model": f"{provider.split(' ')[0]}:{model}",
                      "annotated_at": datetime.now().isoformat(timespec="seconds"), **res})
+        if checkpoint:
+            checkpoint(_merge_annotations(existing, rows))
         time.sleep(delay)
-    parts = [d for d in (existing, pd.DataFrame(rows)) if not d.empty]
-    res = (pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()).reindex(columns=ANNOT_COLS)
-    res["sentiment_score"] = pd.to_numeric(res["sentiment_score"], errors="coerce")
-    return res
+    return _merge_annotations(existing, rows)
+
+
+# ─────────────────────────────────────────────
+# Φόρτωση / πακέτο αποτελεσμάτων
+# ─────────────────────────────────────────────
+def classify_upload(df: pd.DataFrame) -> str | None:
+    """'articles' ή 'annotations' ανάλογα με τις στήλες· None αν δεν αναγνωρίζεται."""
+    cols = set(df.columns)
+    if {"url_key", "sentiment_label"} <= cols:
+        return "annotations"
+    if {"url_key", "status", "text"} <= cols:
+        return "articles"
+    return None
+
+
+def clean_loaded(df: pd.DataFrame, kind: str) -> pd.DataFrame:
+    df = df.copy()
+    df["url_key"] = df["url_key"].astype(str)
+    if kind == "articles":
+        df = df.reindex(columns=ARTICLE_COLS)
+        df["word_count"] = pd.to_numeric(df["word_count"], errors="coerce")
+    else:
+        df = df.reindex(columns=ANNOT_COLS)
+        df["sentiment_score"] = pd.to_numeric(df["sentiment_score"], errors="coerce")
+    return df.drop_duplicates("url_key", keep="last").reset_index(drop=True)
+
+
+def read_uploads(files: list[tuple[str, bytes]]) -> dict[str, pd.DataFrame]:
+    """Διαβάζει CSV ή ZIP (με CSV μέσα) και επιστρέφει {'articles': df, 'annotations': df}."""
+    import io
+    import zipfile
+    found: dict[str, pd.DataFrame] = {}
+
+    def _add(name, raw):
+        df = pd.read_csv(io.BytesIO(raw), dtype={"url_key": str})
+        kind = classify_upload(df)
+        if kind is None:
+            raise ValueError(f"Το «{name}» δεν αναγνωρίζεται ως articles ή annotations.")
+        df = clean_loaded(df, kind)
+        found[kind] = df if kind not in found else clean_loaded(pd.concat([found[kind], df]), kind)
+
+    for name, raw in files:
+        if name.lower().endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                for n in z.namelist():
+                    if n.lower().endswith(".csv"):
+                        _add(n, z.read(n))
+        else:
+            _add(name, raw)
+    return found
+
+
+def merge_loaded(current: pd.DataFrame | None, new: pd.DataFrame, kind: str) -> pd.DataFrame:
+    """Ένωση με τα υπάρχοντα· για το ίδιο άρθρο υπερισχύει το φορτωμένο."""
+    if current is None or current.empty:
+        return clean_loaded(new, kind)
+    return clean_loaded(pd.concat([current, new], ignore_index=True), kind)
+
+
+def make_bundle(articles: pd.DataFrame | None, annotations: pd.DataFrame | None, meta: dict) -> bytes:
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        if articles is not None:
+            z.writestr("articles.csv", articles.to_csv(index=False))
+        if annotations is not None:
+            z.writestr("annotations.csv", annotations.to_csv(index=False))
+        z.writestr("info.json", json.dumps(meta, ensure_ascii=False, indent=2))
+    return buf.getvalue()
 
 
 # ─────────────────────────────────────────────
@@ -355,6 +446,9 @@ def main():
                     choices=["mistral", "groq", "openrouter", "ollama", "gemini"])
     ap.add_argument("--model", default=None, help="Παράκαμψη του προεπιλεγμένου μοντέλου του παρόχου")
     ap.add_argument("--retry-failed", action="store_true")
+    ap.add_argument("--batch", type=int, default=10,
+                    help="Αποθήκευση του annotations.csv κάθε τόσα άρθρα (προεπιλογή 10)")
+    ap.add_argument("--limit", type=int, default=None, help="Μέγιστος αριθμός άρθρων σε αυτό το τρέξιμο")
     a = ap.parse_args()
 
     title, clips = parse_docx(a.docx)
@@ -370,8 +464,17 @@ def main():
         if cfg["key_env"] and not key:
             raise SystemExit(f"Ορίστε {cfg['key_env']} στο περιβάλλον.")
         arts = _load(ARTICLES, ARTICLE_COLS)
+        counter = {"n": 0}
+
+        def _save_every_batch(d):
+            counter["n"] += 1
+            if counter["n"] % a.batch == 0:
+                d.to_csv(ANNOTATIONS, index=False)
+                print(f"  ✓ αποθηκεύτηκαν {len(d)} επισημειώσεις")
+
         df = annotate_all(arts, title or "Φεστιβάλ", key, provider=provider, model=a.model,
-                          delay=a.delay, progress=_cli_progress)
+                          delay=a.delay, limit=a.limit, checkpoint=_save_every_batch,
+                          progress=_cli_progress)
         df.to_csv(ANNOTATIONS, index=False)
         print(df.sentiment_label.value_counts())
 

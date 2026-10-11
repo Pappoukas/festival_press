@@ -124,10 +124,41 @@ date_pref = st.sidebar.radio(
 include_dups = st.sidebar.checkbox("Συμπερίληψη διπλοεγγραφών", value=False,
                                    help="Ο ίδιος σύνδεσμος καταχωρισμένος περισσότερες από μία φορές.")
 
+# ─────────────────────────────────────────────
+# Δεδομένα εμπλουτισμού: αποθηκευμένα → φορτωμένα από τον χρήστη → συνεδρία
+# ─────────────────────────────────────────────
+from enrich import ANNOT_COLS, ARTICLE_COLS, annotatable, make_bundle, merge_loaded, read_uploads  # noqa: E402
+
+for _k, _f in (("articles", ARTICLES_FILE), ("annotations", ANNOT_FILE)):
+    if _k not in st.session_state:
+        _d = csv_or_none(_f)
+        if _d is not None:
+            st.session_state[_k] = _d
+            st.session_state.setdefault("from_repo", set()).add(_k)
+
+st.sidebar.subheader("📂 Αποθηκευμένα αποτελέσματα")
+uploads = st.sidebar.file_uploader(
+    "Φόρτωση articles.csv / annotations.csv ή πακέτου .zip", type=["csv", "zip"],
+    accept_multiple_files=True,
+    help="Ό,τι κατεβάσατε από προηγούμενη συνεδρία. Ενώνεται με τα υπάρχοντα· "
+         "για το ίδιο άρθρο υπερισχύει το αρχείο που ανεβάζετε.")
+seen = st.session_state.setdefault("seen_uploads", set())
+for up in uploads or []:
+    if up.file_id in seen:
+        continue
+    seen.add(up.file_id)
+    try:
+        for _kind, _d in read_uploads([(up.name, up.getvalue())]).items():
+            st.session_state[_kind] = merge_loaded(st.session_state.get(_kind), _d, _kind)
+            st.session_state.get("from_repo", set()).discard(_kind)
+            st.sidebar.success(f"{up.name}: {len(_d)} εγγραφές ({_kind})")
+    except Exception as e:  # noqa: BLE001
+        st.sidebar.error(f"{up.name}: {e}")
+
 # Συνένωση με μέσα, κείμενα, επισημειώσεις
 outlets = pd.read_csv(OUTLETS_FILE)
-articles = st.session_state.get("articles", csv_or_none(ARTICLES_FILE))
-annots = st.session_state.get("annotations", csv_or_none(ANNOT_FILE))
+articles = st.session_state.get("articles")
+annots = st.session_state.get("annotations")
 
 df = clips.merge(outlets, on="host", how="left")
 df["outlet"] = df["outlet"].fillna(df["print_outlet"]).fillna(df["host"])
@@ -156,20 +187,33 @@ kinds = sorted(df.kind.unique())
 sel_kind = st.sidebar.multiselect("Είδος", kinds, default=kinds)
 
 st.sidebar.divider()
+_ok_keys = set(annotatable(articles).url_key) if articles is not None else set()
+n_ok = len(_ok_keys)
+n_ann = (len(_ok_keys & set(annots.url_key)) if _ok_keys else len(annots)) if annots is not None else 0
 st.sidebar.markdown(
     "**Πηγή δεδομένων:** αποδελτίωση Τύπου (.docx)\n\n"
     f"**Κείμενα:** {'✅ ' + str(int((articles.status == 'ok').sum())) + ' άρθρα' if articles is not None else '— (βλ. Εμπλουτισμός)'}\n\n"
-    f"**Επισημείωση LLM:** {'✅ ' + str(len(annots)) + ' άρθρα' if annots is not None else '—'}"
+    f"**Επισημείωση LLM:** {f'{n_ann} / {n_ok} άρθρα' if articles is not None else (str(n_ann) if n_ann else '—')}"
 )
-if "articles" in st.session_state or "annotations" in st.session_state:
-    st.sidebar.warning("Τα δεδομένα εμπλουτισμού αυτής της συνεδρίας δεν είναι ακόμη στο repo. "
-                       "Κατεβάστε τα και ανεβάστε τα στον φάκελο data/.")
-    if "articles" in st.session_state:
-        st.sidebar.download_button("💾 articles.csv", st.session_state["articles"].to_csv(index=False).encode("utf-8"),
-                                   file_name="articles.csv", width="stretch", key="dl_art_side")
-    if "annotations" in st.session_state:
-        st.sidebar.download_button("💾 annotations.csv", st.session_state["annotations"].to_csv(index=False).encode("utf-8"),
-                                   file_name="annotations.csv", width="stretch", key="dl_ann_side")
+if n_ok:
+    st.sidebar.progress(min(1.0, n_ann / n_ok))
+if articles is not None or annots is not None:
+    unsaved = {"articles", "annotations"} - st.session_state.get("from_repo", set())
+    if unsaved & set(k for k in ("articles", "annotations") if k in st.session_state):
+        st.sidebar.caption("💡 Κατεβάστε το πακέτο για να συνεχίσετε αργότερα ή για να το "
+                           "ανεβάσετε στον φάκελο data/ του repo.")
+    st.sidebar.download_button(
+        "💾 Πακέτο αποτελεσμάτων (.zip)",
+        make_bundle(articles, annots, {"title": title, "articles": 0 if articles is None else len(articles),
+                                       "annotations": n_ann, "saved_at": datetime.now().isoformat(timespec="seconds")}),
+        file_name=f"festival_press_{datetime.now():%Y%m%d_%H%M}.zip", width="stretch", key="dl_bundle")
+    c_a, c_b = st.sidebar.columns(2)
+    if articles is not None:
+        c_a.download_button("articles.csv", articles.to_csv(index=False).encode("utf-8"),
+                            file_name="articles.csv", width="stretch", key="dl_art_side")
+    if annots is not None:
+        c_b.download_button("annotations.csv", annots.to_csv(index=False).encode("utf-8"),
+                            file_name="annotations.csv", width="stretch", key="dl_ann_side")
 st.sidebar.markdown("**Απεικόνιση:** Καλλίνικος Κωνσταντίνος")
 
 # ─────────────────────────────────────────────
@@ -613,12 +657,14 @@ st.divider()
 # ═════════════════════════════════════════════
 # 7. ΕΜΠΛΟΥΤΙΣΜΟΣ ΔΕΔΟΜΕΝΩΝ
 # ═════════════════════════════════════════════
-with st.expander("⚙️ Εμπλουτισμός δεδομένων (λήψη κειμένων & επισημείωση LLM)"):
+with st.expander("⚙️ Εμπλουτισμός δεδομένων (λήψη κειμένων & επισημείωση LLM)",
+                 expanded="auto_job" in st.session_state):
     st.markdown(
         "Προτεινόμενη ροή: εκτέλεση **τοπικά** με `python enrich.py fetch` και "
         "`python enrich.py annotate --provider mistral`, και commit των `data/articles.csv` / `data/annotations.csv`. "
-        "Εναλλακτικά από εδώ — τα αποτελέσματα κρατιούνται μόνο για την τρέχουσα συνεδρία, "
-        "οπότε κατεβάστε τα CSV και ανεβάστε τα στο repo.")
+        "Εναλλακτικά από εδώ: η επισημείωση γίνεται σε παρτίδες και κάθε αποτέλεσμα κρατιέται αμέσως. "
+        "Κατεβάστε το **πακέτο .zip** από την πλαϊνή μπάρα και, την επόμενη φορά, ανεβάστε το στο "
+        "«📂 Αποθηκευμένα αποτελέσματα» για να συνεχίσετε από εκεί που μείνατε.")
     from enrich import PROVIDERS, FatalAPIError, annotate_all, fetch_all, list_models
 
     a1, a2 = st.columns(2)
@@ -627,9 +673,11 @@ with st.expander("⚙️ Εμπλουτισμός δεδομένων (λήψη �
         retry = st.checkbox("Επανάληψη όσων απέτυχαν", value=False)
         if st.button("▶️ Λήψη", width="stretch"):
             bar = st.progress(0.0, "Έναρξη…")
-            res = fetch_all(clips, existing=articles, retry_failed=retry,
+            res = fetch_all(clips, existing=articles if articles is not None else pd.DataFrame(columns=ARTICLE_COLS),
+                            retry_failed=retry,
                             progress=lambda i, n, u: bar.progress(i / max(n, 1), f"{i}/{n} · {u[:60]}"))
             st.session_state["articles"] = res
+            st.session_state.get("from_repo", set()).discard("articles")
             try:
                 res.to_csv(ARTICLES_FILE, index=False)
             except OSError:
@@ -637,7 +685,7 @@ with st.expander("⚙️ Εμπλουτισμός δεδομένων (λήψη �
             st.rerun()
         if articles is not None:
             st.download_button("💾 articles.csv", articles.to_csv(index=False).encode("utf-8"),
-                               file_name="articles.csv", width="stretch")
+                               file_name="articles.csv", width="stretch", key="dl_art_exp")
     with a2:
         st.markdown("**2. Επισημείωση** (LLM)")
         prov = st.selectbox("Πάροχος", [p for p in PROVIDERS if not p.startswith("Ollama")],
@@ -671,27 +719,61 @@ with st.expander("⚙️ Εμπλουτισμός δεδομένων (λήψη �
             used = sorted(annots.model.dropna().unique())
             st.caption(f"Ήδη επισημειωμένα με: {', '.join(used)}. Για συγκρίσιμα αποτελέσματα "
                        "καλό είναι όλο το corpus να επισημειωθεί με το ίδιο μοντέλο.")
-        if st.button("▶️ Επισημείωση", width="stretch", disabled=not (key and articles is not None)):
+        batch = st.number_input("Άρθρα ανά παρτίδα", 1, 50, 10, 1,
+                                help="Τα αποτελέσματα αποθηκεύονται μετά από κάθε άρθρο· η παρτίδα "
+                                     "ορίζει πόσα θα γίνουν πριν η σελίδα ανανεωθεί.")
+        remaining = max(0, n_ok - n_ann) if articles is not None else 0
+        st.caption(f"Υπόλοιπα για επισημείωση: **{remaining}** από {n_ok}")
+
+        def _checkpoint(d):
+            st.session_state["annotations"] = d
+            st.session_state.get("from_repo", set()).discard("annotations")
+            try:
+                d.to_csv(ANNOT_FILE, index=False)
+            except OSError:
+                pass
+
+        def _run_batch(job):
             bar = st.progress(0.0, "Έναρξη…")
             try:
-                res = annotate_all(articles, title or "Φεστιβάλ", key, provider=prov, model=model,
-                                   delay=delay, existing=annots,
-                                   progress=lambda i, n, u: bar.progress(i / max(n, 1), f"{i}/{n} · {u[:60]}"))
+                annotate_all(articles, title or "Φεστιβάλ", job["key"], provider=job["prov"],
+                             model=job["model"], delay=job["delay"],
+                             existing=annots if annots is not None else pd.DataFrame(columns=ANNOT_COLS),
+                             limit=job["batch"], checkpoint=_checkpoint,
+                             progress=lambda i, n, u: bar.progress(i / max(n, 1), f"{i}/{n} · {u[:60]}"))
             except FatalAPIError as e:
+                st.session_state.pop("auto_job", None)
                 msg = str(e)
                 hint = ("Το κλειδί δεν έγινε δεκτό." if msg.startswith(("401", "403"))
                         else "Το μοντέλο δεν υπάρχει ή έχει αποσυρθεί — πατήστε «Έλεγχος διαθέσιμων μοντέλων».")
                 st.error(f"{hint}\n\nΑπάντηση παρόχου: {msg}")
                 st.stop()
             except RuntimeError as e:
+                st.session_state.pop("auto_job", None)
                 st.error(str(e))
                 st.stop()
-            st.session_state["annotations"] = res
-            try:
-                res.to_csv(ANNOT_FILE, index=False)
-            except OSError:
-                pass
             st.rerun()
+
+        job = dict(prov=prov, key=key, model=model, delay=delay, batch=int(batch))
+        ready = bool(key) and articles is not None and remaining > 0
+        b1, b2 = st.columns(2)
+        if b1.button(f"▶️ Επόμενα {int(batch)}", width="stretch", disabled=not ready):
+            st.session_state.pop("auto_job", None)
+            _run_batch(job)
+        if b2.button("⏩ Όλα, σε παρτίδες", width="stretch", disabled=not ready):
+            st.session_state["auto_job"] = job
+        auto = st.session_state.get("auto_job")
+        if auto:
+            if st.button("⏹️ Διακοπή", width="stretch", type="primary"):
+                st.session_state.pop("auto_job", None)
+                st.rerun()
+            elif remaining > 0:
+                st.info(f"⏩ Αυτόματη συνέχεια: παρτίδα των {auto['batch']} · υπόλοιπα {remaining}. "
+                        "Μπορείτε να κατεβάσετε το πακέτο από την πλαϊνή μπάρα οποιαδήποτε στιγμή.")
+                _run_batch(auto)
+            else:
+                st.session_state.pop("auto_job", None)
+                st.success("✅ Ολοκληρώθηκε η επισημείωση όλων των άρθρων.")
         if annots is not None:
             st.download_button("💾 annotations.csv", annots.to_csv(index=False).encode("utf-8"),
-                               file_name="annotations.csv", width="stretch")
+                               file_name="annotations.csv", width="stretch", key="dl_ann_exp")
